@@ -12,31 +12,28 @@ module.exports = function useMongoDBAuthState(collection) {
 
     const readData = async (id) => {
         const result = await collection.findOne({ _id: id });
-        if (result) {
-            return JSON.parse(result.data, BufferJSON.reviver);
-        }
-        return null;
+        return result ? JSON.parse(result.data, BufferJSON.reviver) : null;
     };
 
     const removeData = async (id) => {
         await collection.deleteOne({ _id: id });
     };
 
+    const creds = initAuthCreds();
+
     return {
         state: {
-            creds: initAuthCreds(),
+            creds,
             keys: {
                 get: async (type, ids) => {
                     const data = {};
-                    await Promise.all(
-                        ids.map(async (id) => {
-                            let value = await readData(`${type}-${id}`);
-                            if (type === 'app-state-sync-key' && value) {
-                                value = proto.Message.AppStateSyncKeyData.fromObject(value);
-                            }
-                            data[id] = value;
-                        })
-                    );
+                    await Promise.all(ids.map(async (id) => {
+                        let value = await readData(`${type}-${id}`);
+                        if (type === 'app-state-sync-key' && value) {
+                            value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                        }
+                        data[id] = value;
+                    }));
                     return data;
                 },
                 set: async (data) => {
@@ -53,7 +50,7 @@ module.exports = function useMongoDBAuthState(collection) {
             }
         },
         saveCreds: async () => {
-            // Esta función será inyectada con las credenciales actuales por Baileys
+            await writeData(creds, 'creds');
         }
     };
 };
