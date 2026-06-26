@@ -43,12 +43,40 @@ const MONGODB_URL = process.env.MONGODB_URL || process.env.MONGO_URI;
 let sock; 
 let lastQR = null;
 
-// Endpoint /qr simplificado: Usa una API externa para mostrar el QR
+// ==========================================================================
+// 📦 NUEVO: SISTEMA DE COLA (QUEUE) PARA EVITAR ERROR 429
+// Este bloque gestiona los mensajes uno por uno con un retraso para no saturar.
+// ==========================================================================
+const messageQueue = [];
+let isProcessingQueue = false;
+
+async function processQueue() {
+    if (isProcessingQueue || messageQueue.length === 0) return;
+    isProcessingQueue = true;
+
+    while (messageQueue.length > 0) {
+        const { jid, content, resolve, reject } = messageQueue.shift();
+        
+        try {
+            // Retraso humano de 1.5 segundos entre mensajes para evitar bloqueos y 429
+            await new Promise(res => setTimeout(res, 1500));
+
+            await sock.sendMessage(jid, content);
+            logger.info(`✅ Mensaje enviado exitosamente a ${jid}`);
+            resolve({ status: 'success', to: jid });
+        } catch (error) {
+            logger.error(`❌ Error al enviar mensaje a ${jid}: ${error.message}`);
+            reject(error);
+        }
+    }
+    isProcessingQueue = false;
+}
+// ==========================================================================
+
 app.get('/qr', (req, res) => {
     if (!lastQR) {
         return res.send('<h1>El bot ya está conectado o el QR no se ha generado aún.</h1><p>Refresca en unos segundos si acabas de reiniciar.</p>');
     }
-    // Generamos la URL de una API de QR externa para no necesitar librerías locales
     const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(lastQR)}`;
     res.send(`
         <html>
@@ -65,31 +93,42 @@ app.get('/qr', (req, res) => {
     `);
 });
 
-// Endpoint raíz para verificar que Express funciona
 app.get('/', (req, res) => {
     res.send('<h1>Servidor WhatsApp Bridge Activo</h1><p>Ve a <a href="/qr">/qr</a> para conectar.</p>');
 });
 
-// Endpoint para enviar mensajes
-app.post('/send-message', async (req, res) => {
+// ==========================================================================
+// 🚀 ENDPOINT /SEND-MESSAGE MODIFICADO PARA USAR LA COLA
+// ==========================================================================
+app.post('/send-message', (req, res) => {
     const { number, message, to, isImage } = req.body;
     const phoneNumber = to || number;
-    if (!phoneNumber || !message) return res.status(400).json({ error: 'Faltan parámetros' });
-    try {
-        const jid = phoneNumber.includes('@s.whatsapp.net') ? phoneNumber : `${phoneNumber}@s.whatsapp.net`;
-        const urlString = String(message).toLowerCase();
-        if (urlString.includes('.mp4') || urlString.includes('video')) {
-            await sock.sendMessage(jid, { video: { url: message } });
-        } else if (isImage === true || isImage === "true" || urlString.includes('.png') || urlString.includes('.jpg')) {
-            await sock.sendMessage(jid, { image: { url: message } });
-        } else {
-            await sock.sendMessage(jid, { text: message });
-        }
-        res.json({ status: 'success', to: jid });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+
+    if (!phoneNumber || !message) {
+        return res.status(400).json({ error: 'Faltan parámetros' });
     }
+
+    const jid = phoneNumber.includes('@s.whatsapp.net') ? phoneNumber : `${phoneNumber}@s.whatsapp.net`;
+    const urlString = String(message).toLowerCase();
+    let content;
+
+    if (urlString.includes('.mp4') || urlString.includes('video')) {
+        content = { video: { url: message } };
+    } else if (isImage === true || isImage === "true" || urlString.includes('.png') || urlString.includes('.jpg')) {
+        content = { image: { url: message } };
+    } else {
+        content = { text: message };
+    }
+
+    // CAMBIO: En lugar de sock.sendMessage directo, lo metemos en la cola
+    new Promise((resolve, reject) => {
+        messageQueue.push({ jid, content, resolve, reject });
+        processQueue(); // Iniciar el procesador si no está corriendo
+    })
+    .then(result => res.json(result))
+    .catch(error => res.status(500).json({ error: error.message }));
 });
+// ==========================================================================
 
 async function startWhatsAppBot() {
     if (!MONGODB_URL) {
@@ -147,11 +186,16 @@ async function startWhatsAppBot() {
         if (!msg.message || msg.key.fromMe) return;
         const from = msg.key.remoteJid;
         if (from.includes('@g.us')) return;
+
         try {
             if (msg.message?.audioMessage) {
                 const audioBuffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
                 const audioBase64 = audioBuffer.toString('base64');
-                const payload = { message: '', sender: from, platform: 'whatsapp', isVoiceMessage: true, audio: audioBase64, audio_mimetype: msg.message.audioMessage.mimetype || 'audio/ogg' };
+                const payload = {
+                    message: '', sender: from, platform: 'whatsapp',
+                    isVoiceMessage: true, audio: audioBase64,
+                    audio_mimetype: msg.message.audioMessage.mimetype || 'audio/ogg'
+                };
                 const response = await axios.post(WEBHOOK_URL, payload, { timeout: 60000 });
                 const agentResponse = response.data.response || 'Sin respuesta.';
                 await sock.sendMessage(from, { text: agentResponse });
@@ -163,17 +207,13 @@ async function startWhatsAppBot() {
             const response = await axios.post(WEBHOOK_URL, payload, { timeout: 30000 });
             const agentResponse = response.data.response || 'No entendí tu mensaje.';
             await sock.sendMessage(from, { text: agentResponse });
-        } catch (error) { logger.error(`❌ Error: ${error.message}`); }
+        } catch (error) {
+            logger.error(`❌ Error en mensaje: ${error.message}`);
+        }
     });
 }
 
-// Iniciar Servidor Web PRIMERO para que Render esté feliz
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Servidor web activo en puerto ${PORT}`);
-    
-    // Una vez que el servidor web está listo, arrancamos el bot
-    startWhatsAppBot().catch(err => {
-        console.error('❌ Error al iniciar el bot:', err.message);
-        // No cerramos el proceso para que el servidor web siga vivo y Render no lo mate
-    });
+    console.log(`🚀 Servidor en puerto ${PORT}`);
+    startWhatsAppBot().catch(err => console.error('❌ Error bot:', err));
 });
